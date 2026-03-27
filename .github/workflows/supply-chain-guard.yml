@@ -34,16 +34,72 @@ jobs:
           for f in $CHANGED_FILES; do
             [ -f "$f" ] || continue
 
-            if grep -qiE 'litellm[>=!~]' "$f"; then
-              if grep -qE 'litellm==1\.78\.2' "$f"; then
-                echo "OK: $f has litellm pinned to safe version 1.78.2"
-              else
-                echo "BLOCKED: $f contains litellm dependency NOT pinned to ==1.78.2"
-                echo "  litellm 1.82.7/1.82.8 are compromised (TeamPCP, Mar 2026)"
-                echo "  Pin to litellm==1.78.2 or remove the dependency"
-                grep -n 'litellm' "$f" || true
-                BLOCKED=1
-              fi
+            # Detect any reference to litellm in the file (case-insensitive),
+            # including unpinned, spaced operators, and lockfile formats.
+            if grep -qi 'litellm' "$f"; then
+              case "$f" in
+                *poetry.lock|*Pipfile.lock|*uv.lock)
+                  # Lockfile handling:
+                  # Consider safe only if every litellm entry is associated with version 1.78.2
+                  # and none associate with known compromised versions 1.82.7/1.82.8.
+                  SAFE_COUNT=0
+                  TOTAL_COUNT=0
+                  COMPROMISED_FOUND=0
+                  while IFS= read -r ln; do
+                    ln_num="${ln%%:*}"
+                    TOTAL_COUNT=$((TOTAL_COUNT+1))
+                    # Grab a window around the litellm mention to locate the version field
+                    context="$(sed -n "$((ln_num-5)),$((ln_num+10))p" "$f" 2>/dev/null || true)"
+                    if printf '%s\n' "$context" | grep -qiE '1\.82\.7|1\.82\.8'; then
+                      COMPROMISED_FOUND=1
+                      break
+                    fi
+                    if printf '%s\n' "$context" | grep -qiE 'version[[:space:]]*[:=][[:space:]]*"?=?[[:space:]]*1\.78\.2"?' ; then
+                      SAFE_COUNT=$((SAFE_COUNT+1))
+                    fi
+                  done <<EOF
+$(grep -ni 'litellm' "$f" || true)
+EOF
+                  if [ "$COMPROMISED_FOUND" -eq 1 ]; then
+                    echo "BLOCKED: $f associates litellm with compromised versions (1.82.7/1.82.8)."
+                    grep -n -i 'litellm' "$f" || true
+                    BLOCKED=1
+                  elif [ "$TOTAL_COUNT" -gt 0 ] && [ "$SAFE_COUNT" -eq "$TOTAL_COUNT" ]; then
+                    echo "OK: $f associates litellm with safe version 1.78.2"
+                  else
+                    echo "BLOCKED: $f references litellm but not all entries are pinned to safe version 1.78.2 in lockfile context."
+                    grep -n -i 'litellm' "$f" || true
+                    BLOCKED=1
+                  fi
+                  ;;
+                *)
+                  # Non-lock files (requirements/pyproject/setup.*):
+                  # All litellm occurrences must be pinned to safe version 1.78.2.
+                  # Allow formats like:
+                  #   litellm==1.78.2
+                  #   litellm [extras] == 1.78.2
+                  #   litellm = "1.78.2"  (toml)
+                  #   "litellm" = "==1.78.2"  (toml)
+                  SAFE_LINE_REGEX='litellm([[:space:]]*\[[^]]+\])?[[:space:]]*==[[:space:]]*1\.78\.2|litellm[[:space:]]*=[[:space:]]*["'\'']1\.78\.2["'\'']'
+                  # Gather all lines mentioning litellm (ignore fully commented lines)
+                  LINES_WITH_LITELLM="$(grep -in -i 'litellm' "$f" | grep -viE '^[[:space:]]*#' || true)"
+                  if [ -z "$LINES_WITH_LITELLM" ]; then
+                    # Only comments mention litellm; treat as no dependency.
+                    continue
+                  fi
+                  # Identify any line that does NOT match the safe pattern
+                  UNSAFE_LINES="$(printf '%s\n' "$LINES_WITH_LITELLM" | grep -viE "$SAFE_LINE_REGEX" || true)"
+                  if [ -n "$UNSAFE_LINES" ]; then
+                    echo "BLOCKED: $f contains litellm entries not pinned to safe version 1.78.2"
+                    printf '%s\n' "$UNSAFE_LINES"
+                    echo "  litellm 1.82.7/1.82.8 are compromised (TeamPCP, Mar 2026)"
+                    echo "  Pin to litellm==1.78.2 (or litellm = \"1.78.2\" in TOML) or remove the dependency"
+                    BLOCKED=1
+                  else
+                    echo "OK: $f has all litellm entries pinned to safe version 1.78.2"
+                  fi
+                  ;;
+              esac
             fi
           done
 
